@@ -1,0 +1,7 @@
+openpyxl>=3.1
+pydantic>=2.6
+mcp[cli]>=1.2
+
+[dev]
+pytest>=8.0
+pytest-cov

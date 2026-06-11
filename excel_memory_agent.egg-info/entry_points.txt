@@ -1,0 +1,3 @@
+[console_scripts]
+ema = ema.cli:main
+ema-server = ema.server:main
