@@ -1,7 +1,7 @@
 # Excel Memory Agent — Final Architecture
 
 **Status:** Authoritative implementation specification. This is the single source of truth for development.
-**Scope:** Safe, AI-powered append-to-Excel. A Python package (`ema/`), a JSON registry, a paranoid Excel writer, a thin FastMCP server, and an optional local-LLM natural-language front-end (Ollama).
+**Scope:** A safe Excel automation layer for AI agents — model-agnostic Excel infrastructure for automating *existing business workbooks* (expense trackers, bookkeeping, accounting, inventory, sales reports, tax workbooks). Delivered as a Python package (`ema/`), a JSON registry, a paranoid Excel writer, an Excel MCP server (thin FastMCP), and an optional local-LLM natural-language front-end (Ollama). EMA lets any agent — local or hosted — make safe updates to workbooks that contain formulas, tables, reports, and business logic.
 
 ---
 
@@ -14,7 +14,7 @@
 5. **Local-first and opt-in.** The core installs and runs with no model and no cloud. The LLM is an optional extra, disabled by default.
 6. **Simplicity over abstraction.** One file per concern. One provider Protocol with one real implementation. No plugin frameworks, no per-workbook prompt files.
 
-**Scope guarantee (state in README):** EMA targets *simple tabular* and *Excel-Table* workbooks. Workbooks with charts/pivots/macros may lose those features on write; EMA backs up before every write so nothing is unrecoverable.
+**Scope guarantee (state in README):** EMA safely updates the *tabular regions* of business workbooks (plain ranges and Excel Tables). EMA does **not** guarantee loss-free round-tripping of pivots, charts, or VBA/macros. Backups and undo remain the safety mechanism: EMA backs up before every write, so nothing is unrecoverable.
 
 ---
 
@@ -78,7 +78,9 @@ excel-memory-agent/
 │   ├── test_cli.py
 │   └── test_server.py
 ├── examples/
-│   └── FoodLog.xlsx
+│   ├── Expenses.xlsx
+│   ├── Inventory.xlsx
+│   └── Bookkeeping.xlsx
 ├── .ema/                    # runtime state (kept OUTSIDE any cloud-synced folder)
 ├── pyproject.toml
 ├── README.md
@@ -213,7 +215,7 @@ class WorkbookSchema(BaseModel):
 
 
 class WorkbookEntry(BaseModel):
-    id: str                         # slug, e.g. "foodlog"
+    id: str                         # slug, e.g. "expenses"
     name: str
     path: Path                      # absolute path to .xlsx
     primary_sheet: str
@@ -702,8 +704,8 @@ Tests run with no real LLM and no MCP. They hit `EmaService` and the modules dir
 
 ## 19. Definition of Done
 
-- The structured MCP path works end-to-end on a real `FoodLog.xlsx` (plain *and* table variants), with backup + undo demonstrably recovering from a bad write.
-- With Ollama running, `ema add "Save dinner: 2 eggs, 200g skyr, 20g roasted edamame" --workbook foodlog` prints a labeled preview and, on confirm, appends one verified row.
+- The structured MCP path works end-to-end on a real `Expenses.xlsx` (plain *and* Excel-Table variants), with backup + undo demonstrably recovering from a bad write.
+- With Ollama running, `ema add "Record office supplies expense 42.90 EUR at Staples on 2026-06-10" --workbook expenses` prints a labeled preview and, on confirm, appends one verified row.
 - Every test green; ≥90% coverage on `excel_io.py` and `service.py`; the core and the structured path remain entirely LLM-free.
 
 ---

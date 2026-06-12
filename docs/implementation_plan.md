@@ -100,7 +100,7 @@ Each milestone: **Goal → Build → Tests → Exit checkpoint → Deliverable.*
 - **Goal:** Expose the structured path to MCP hosts.
 - **Build:** Five always-on tools as thin wrappers; `EmaError` → structured error dict; logging to file (never stdout); `main()` stdio entry.
 - **Tests:** `test_server.py` — each tool returns JSON-serializable dict; `EmaError` is converted, not raised; `append_from_text` absent (flags off).
-- **Checkpoint:** Manual smoke test in an MCP host (Claude Desktop / Cursor): register a real `FoodLog.xlsx`, append via the host, undo.
+- **Checkpoint:** Manual smoke test in an MCP host (Claude Desktop / Cursor): register a real `Expenses.xlsx`, append via the host, undo.
 - **Deliverable & GATE 1:** Shippable, safe, structured MCP product. Tag `v0.1.0`.
 
 ---
@@ -155,9 +155,9 @@ Each milestone: **Goal → Build → Tests → Exit checkpoint → Deliverable.*
 
 #### M14 — Documentation & release
 - **Goal:** A reviewer can install and demo in minutes.
-- **Build:** `README.md` — quickstart, scope guarantee, MCP-vs-CLI guide, Ollama setup, breakfast/expense demos (gif/screenshot).
+- **Build:** `README.md` — quickstart, scope guarantee, MCP-vs-CLI guide, Ollama setup, business-workbook demos against `Expenses.xlsx` and `Bookkeeping.xlsx` (gif/screenshot).
 - **Checkpoint:** Fresh-clone install + both demos reproduce from the README alone.
-- **Deliverable & GATE 2:** Tag `v0.2.0` — full safe, local, AI-powered Excel append.
+- **Deliverable & GATE 2:** Tag `v0.2.0` — full safe, local, AI-powered automation of business workbooks.
 
 ---
 

@@ -1,9 +1,4 @@
-"""Excel file safety checks for EMA.
-
-Only the M5 Step 1 `check_writable()` and Step 2 `backup()` entry points are
-implemented here. The rest of the writer surface remains intentionally
-unimplemented.
-"""
+"""Safe Excel writer utilities for EMA."""
 
 from __future__ import annotations
 
@@ -96,50 +91,11 @@ def _next_backup_path(backup_dir: Path, workbook_stem: str) -> Path:
 
 
 def append_row(path: Path, schema: WorkbookSchema, row: dict[str, object]) -> AppendResult:
-    """Append one validated row to a non-table workbook and return the result.
+    """Append one validated row to either a plain sheet or an Excel Table."""
 
-    This Step 3 implementation supports plain, formula, and offset-header
-    workbooks only. It intentionally does not implement dry-run handling,
-    verify-write, atomic save, table append logic, or undo support.
-    """
-
-    check_writable(path)
-    validate_live_schema(path, schema)
-    _validate_row_input(schema, row)
-
-    workbook = load_workbook(path)
-    try:
-        try:
-            worksheet = workbook[schema.sheet]
-        except KeyError as exc:
-            raise SheetNotFoundError(f"Worksheet not found: {schema.sheet}") from exc
-
-        target_row = _next_writable_row(worksheet, schema)
-        ordered_preview: dict[str, object] = {}
-
-        for column in schema.columns:
-            if column.name not in row:
-                continue
-
-            value = _validated_cell_value(column, row[column.name])
-            worksheet.cell(row=target_row, column=column.index + 1, value=value)
-            ordered_preview[column.name] = value
-
-        atomic_save(workbook, path)
-    finally:
-        workbook.close()
-
-    return AppendResult(
-        ok=True,
-        workbook_id=path.stem,
-        sheet=schema.sheet,
-        written_row=target_row,
-        row_preview=ordered_preview,
-        backup_path=None,
-        undo_token=None,
-        dry_run=False,
-        message=f"Appended row {target_row} to '{schema.sheet}'.",
-    )
+    if schema.table_name is None:
+        return _append_plain_row(path, schema, row)
+    return _append_table_row(path, schema, row)
 
 
 def verify_write(
@@ -256,56 +212,9 @@ def undo_last(path: Path, undo_token: str) -> UndoResult:
 
 
 def table_append(path: Path, schema: WorkbookSchema, row: dict[str, object]) -> AppendResult:
-    """Append one validated row to an Excel Table workbook and return the result.
+    """Temporary compatibility wrapper for legacy direct table callers."""
 
-    This Step 6 implementation supports only persisted schemas that point at an
-    existing Excel Table. It writes cell values first and then expands
-    `table.ref` to include the new row before saving atomically.
-    """
-
-    check_writable(path)
-    validate_live_schema(path, schema)
-    _validate_row_input(schema, row)
-
-    if schema.table_name is None:
-        raise ValidationError("Table append requires a schema with table_name set.")
-
-    workbook = load_workbook(path)
-    try:
-        try:
-            worksheet = workbook[schema.sheet]
-        except KeyError as exc:
-            raise SheetNotFoundError(f"Worksheet not found: {schema.sheet}") from exc
-
-        table = worksheet.tables[schema.table_name]
-        min_col, min_row, max_col, max_row = range_boundaries(table.ref)
-        target_row = max_row + 1
-        ordered_preview: dict[str, object] = {}
-
-        for column in schema.columns:
-            if column.name not in row:
-                continue
-
-            value = _validated_cell_value(column, row[column.name])
-            worksheet.cell(row=target_row, column=min_col + column.index, value=value)
-            ordered_preview[column.name] = value
-
-        table.ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{target_row}"
-        atomic_save(workbook, path)
-    finally:
-        workbook.close()
-
-    return AppendResult(
-        ok=True,
-        workbook_id=path.stem,
-        sheet=schema.sheet,
-        written_row=target_row,
-        row_preview=ordered_preview,
-        backup_path=None,
-        undo_token=None,
-        dry_run=False,
-        message=f"Appended row {target_row} to table '{schema.table_name}'.",
-    )
+    return _append_table_row(path, schema, row)
 
 
 def _resolve_backup_path(undo_token: str) -> Path:
@@ -322,6 +231,138 @@ def _resolve_backup_path(undo_token: str) -> Path:
         raise UndoError(f"Backup file does not exist: {undo_token}")
 
     return candidate
+
+
+def _append_plain_row(path: Path, schema: WorkbookSchema, row: dict[str, object]) -> AppendResult:
+    """Append a validated row to a plain worksheet path."""
+
+    backup_path, undo_token = _prepare_append(path, schema, row)
+
+    workbook = load_workbook(path)
+    try:
+        worksheet = _get_worksheet(workbook, schema)
+        target_row = _next_writable_row(worksheet, schema)
+        ordered_preview = _write_row_values(worksheet, schema, row, target_row, 1)
+        atomic_save(workbook, path)
+    finally:
+        workbook.close()
+
+    return _finalize_append(
+        path=path,
+        schema=schema,
+        target_row=target_row,
+        ordered_preview=ordered_preview,
+        backup_path=backup_path,
+        undo_token=undo_token,
+        message=f"Appended row {target_row} to '{schema.sheet}'.",
+    )
+
+
+def _append_table_row(path: Path, schema: WorkbookSchema, row: dict[str, object]) -> AppendResult:
+    """Append a validated row to an Excel Table and expand its range."""
+
+    backup_path, undo_token = _prepare_append(path, schema, row)
+
+    if schema.table_name is None:
+        raise ValidationError("Table append requires a schema with table_name set.")
+
+    workbook = load_workbook(path)
+    try:
+        worksheet = _get_worksheet(workbook, schema)
+        table = worksheet.tables[schema.table_name]
+        min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+        target_row = max_row + 1
+        ordered_preview = _write_row_values(worksheet, schema, row, target_row, min_col)
+        table.ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{target_row}"
+        atomic_save(workbook, path)
+    finally:
+        workbook.close()
+
+    return _finalize_append(
+        path=path,
+        schema=schema,
+        target_row=target_row,
+        ordered_preview=ordered_preview,
+        backup_path=backup_path,
+        undo_token=undo_token,
+        message=f"Appended row {target_row} to table '{schema.table_name}'.",
+    )
+
+
+def _prepare_append(
+    path: Path,
+    schema: WorkbookSchema,
+    row: dict[str, object],
+) -> tuple[Path, str]:
+    """Run the shared safety and validation checks required before any append."""
+
+    check_writable(path)
+    validate_live_schema(path, schema)
+    _validate_row_input(schema, row)
+    backup_path = backup(path)
+    return backup_path, str(backup_path)
+
+
+def _finalize_append(
+    *,
+    path: Path,
+    schema: WorkbookSchema,
+    target_row: int,
+    ordered_preview: dict[str, object],
+    backup_path: Path,
+    undo_token: str,
+    message: str,
+) -> AppendResult:
+    """Verify a completed write and build the public append result."""
+
+    try:
+        verify_write(path, schema, ordered_preview, target_row)
+    except WriteVerificationError:
+        undo_last(path, undo_token)
+        raise
+
+    return AppendResult(
+        ok=True,
+        workbook_id=path.stem,
+        sheet=schema.sheet,
+        written_row=target_row,
+        row_preview=ordered_preview,
+        backup_path=str(backup_path),
+        undo_token=undo_token,
+        dry_run=False,
+        message=message,
+    )
+
+
+def _get_worksheet(workbook: Workbook, schema: WorkbookSchema):
+    """Return a worksheet by persisted schema name or raise a typed error."""
+
+    try:
+        return workbook[schema.sheet]
+    except KeyError as exc:
+        raise SheetNotFoundError(f"Worksheet not found: {schema.sheet}") from exc
+
+
+def _write_row_values(
+    worksheet: object,
+    schema: WorkbookSchema,
+    row: dict[str, object],
+    target_row: int,
+    start_column: int,
+) -> dict[str, object]:
+    """Write schema-ordered row values starting at an absolute worksheet column."""
+
+    ordered_preview: dict[str, object] = {}
+
+    for column in schema.columns:
+        if column.name not in row:
+            continue
+
+        value = _validated_cell_value(column, row[column.name])
+        worksheet.cell(row=target_row, column=start_column + column.index, value=value)
+        ordered_preview[column.name] = value
+
+    return ordered_preview
 
 
 def _validate_row_input(schema: WorkbookSchema, row: dict[str, object]) -> None:

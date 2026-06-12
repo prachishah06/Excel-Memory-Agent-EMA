@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shutil
 
 import pytest
 from openpyxl import load_workbook
@@ -482,6 +483,218 @@ def test_append_row_new_row_appears_exactly_once(plain_wb: Path) -> None:
     assert rows.count(new_row) == 1
 
 
+def test_append_row_creates_backup_before_write(
+    ema_home: Path, plain_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """append_row should create a backup before delegating to the atomic save step."""
+
+    events: list[str] = []
+    real_atomic_save = excel_io_module.atomic_save
+
+    def fake_backup(path: Path) -> Path:
+        events.append("backup")
+        backup_path = config.BACKUP_DIR / "plain" / "plain-test-backup.xlsx"
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, backup_path)
+        return backup_path
+
+    def checked_atomic_save(workbook: object, path: Path) -> Path:
+        assert events == ["backup"]
+        events.append("save")
+        return real_atomic_save(workbook, path)
+
+    monkeypatch.setattr(excel_io_module, "backup", fake_backup)
+    monkeypatch.setattr(excel_io_module, "atomic_save", checked_atomic_save)
+
+    excel_io_module.append_row(
+        plain_wb,
+        _plain_schema(),
+        {
+            "Date": "2026-06-12",
+            "Meal": "Snack",
+            "Food": "Apple",
+            "Calories": 95,
+        },
+    )
+
+    assert events == ["backup", "save"]
+
+
+def test_append_row_returns_backup_path(ema_home: Path, plain_wb: Path) -> None:
+    """append_row should return the created backup path in its result."""
+
+    result = excel_io_module.append_row(
+        plain_wb,
+        _plain_schema(),
+        {
+            "Date": "2026-06-12",
+            "Meal": "Snack",
+            "Food": "Apple",
+            "Calories": 95,
+        },
+    )
+
+    assert result.backup_path is not None
+    assert Path(result.backup_path).exists()
+
+
+def test_append_row_returns_undo_token(ema_home: Path, plain_wb: Path) -> None:
+    """append_row should expose an undo token for the created backup."""
+
+    result = excel_io_module.append_row(
+        plain_wb,
+        _plain_schema(),
+        {
+            "Date": "2026-06-12",
+            "Meal": "Snack",
+            "Food": "Apple",
+            "Calories": 95,
+        },
+    )
+
+    assert result.undo_token is not None
+    assert result.undo_token == result.backup_path
+
+
+def test_append_row_invokes_verify_write(
+    ema_home: Path, plain_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """append_row should invoke verify_write after saving."""
+
+    verify_called = False
+
+    def fake_verify_write(*args: object, **kwargs: object) -> None:
+        nonlocal verify_called
+        verify_called = True
+
+    monkeypatch.setattr(excel_io_module, "verify_write", fake_verify_write)
+
+    excel_io_module.append_row(
+        plain_wb,
+        _plain_schema(),
+        {
+            "Date": "2026-06-12",
+            "Meal": "Snack",
+            "Food": "Apple",
+            "Calories": 95,
+        },
+    )
+
+    assert verify_called is True
+
+
+def test_append_row_verify_failure_restores_backup_automatically(
+    ema_home: Path, plain_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If verify_write fails, append_row should restore the workbook from backup."""
+
+    original_bytes = plain_wb.read_bytes()
+
+    def failing_verify_write(*args: object, **kwargs: object) -> None:
+        raise WriteVerificationError("simulated verification failure")
+
+    monkeypatch.setattr(excel_io_module, "verify_write", failing_verify_write)
+
+    with pytest.raises(WriteVerificationError, match="simulated verification failure"):
+        excel_io_module.append_row(
+            plain_wb,
+            _plain_schema(),
+            {
+                "Date": "2026-06-12",
+                "Meal": "Snack",
+                "Food": "Apple",
+                "Calories": 95,
+            },
+        )
+
+    assert plain_wb.read_bytes() == original_bytes
+
+def test_append_row_dispatches_to_plain_helper_when_schema_has_no_table_name(
+    plain_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """append_row should route plain schemas through the plain-row helper."""
+
+    schema = _plain_schema()
+    row = {
+        "Date": "2026-06-12",
+        "Meal": "Snack",
+        "Food": "Apple",
+        "Calories": 95,
+    }
+    sentinel = AppendResult(
+        ok=True,
+        workbook_id="plain",
+        sheet=schema.sheet,
+        written_row=99,
+        row_preview=row,
+        backup_path="backup.xlsx",
+        undo_token="backup.xlsx",
+        dry_run=False,
+        message="plain helper called",
+    )
+    called: dict[str, object] = {}
+
+    def fake_plain_helper(path: Path, helper_schema: WorkbookSchema, helper_row: dict[str, object]) -> AppendResult:
+        called["path"] = path
+        called["schema"] = helper_schema
+        called["row"] = helper_row
+        return sentinel
+
+    def fail_table_helper(*_args: object, **_kwargs: object) -> AppendResult:
+        raise AssertionError("table helper should not be used for plain schemas")
+
+    monkeypatch.setattr(excel_io_module, "_append_plain_row", fake_plain_helper, raising=False)
+    monkeypatch.setattr(excel_io_module, "_append_table_row", fail_table_helper, raising=False)
+
+    result = excel_io_module.append_row(plain_wb, schema, row)
+
+    assert result is sentinel
+    assert called == {"path": plain_wb, "schema": schema, "row": row}
+
+
+
+def test_append_row_dispatches_to_table_helper_when_schema_has_table_name(
+    table_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """append_row should route table schemas through the table-row helper."""
+
+    schema = _table_schema()
+    row = {
+        "Date": "2026-06-12",
+        "Store": "Lidl",
+        "Amount": 22.75,
+        "Category": "Groceries",
+    }
+    sentinel = AppendResult(
+        ok=True,
+        workbook_id="table",
+        sheet=schema.sheet,
+        written_row=55,
+        row_preview=row,
+        backup_path="backup.xlsx",
+        undo_token="backup.xlsx",
+        dry_run=False,
+        message="table helper called",
+    )
+    called: dict[str, object] = {}
+
+    def fail_plain_helper(*_args: object, **_kwargs: object) -> AppendResult:
+        raise AssertionError("plain helper should not be used for table schemas")
+
+    def fake_table_helper(path: Path, helper_schema: WorkbookSchema, helper_row: dict[str, object]) -> AppendResult:
+        called["path"] = path
+        called["schema"] = helper_schema
+        called["row"] = helper_row
+        return sentinel
+
+    monkeypatch.setattr(excel_io_module, "_append_plain_row", fail_plain_helper, raising=False)
+    monkeypatch.setattr(excel_io_module, "_append_table_row", fake_table_helper, raising=False)
+
+    result = excel_io_module.append_row(table_wb, schema, row)
+
+    assert result is sentinel
+    assert called == {"path": table_wb, "schema": schema, "row": row}
+
 def test_verify_write_succeeds_when_appended_row_matches_expected_plain_workbook(
     plain_wb: Path,
 ) -> None:
@@ -926,10 +1139,10 @@ def test_atomic_save_returned_workbook_path_exists_and_is_valid(plain_wb: Path) 
         reopened.close()
 
 
-def test_table_append_appends_row_into_excel_table_workbook(table_wb: Path) -> None:
+def test_append_row_table_appends_row_into_excel_table_workbook(table_wb: Path) -> None:
     """Appending to a table workbook should add one row of values to the sheet."""
 
-    result = excel_io_module.table_append(
+    result = excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
@@ -946,10 +1159,10 @@ def test_table_append_appends_row_into_excel_table_workbook(table_wb: Path) -> N
     assert rows[4] == ["2026-06-12", "Lidl", 22.75, "Groceries"]
 
 
-def test_table_append_writes_new_row_after_last_table_row(table_wb: Path) -> None:
+def test_append_row_table_writes_new_row_after_last_table_row(table_wb: Path) -> None:
     """The new table row should be written immediately after the current table data."""
 
-    excel_io_module.table_append(
+    excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
@@ -964,10 +1177,10 @@ def test_table_append_writes_new_row_after_last_table_row(table_wb: Path) -> Non
     assert rows[4] == ["2026-06-12", "Lidl", 22.75, "Groceries"]
 
 
-def test_table_append_expands_excel_table_range_correctly(table_wb: Path) -> None:
+def test_append_row_table_expands_excel_table_range_correctly(table_wb: Path) -> None:
     """Appending to a table workbook should extend the table range by one row."""
 
-    excel_io_module.table_append(
+    excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
@@ -986,12 +1199,12 @@ def test_table_append_expands_excel_table_range_correctly(table_wb: Path) -> Non
         workbook.close()
 
 
-def test_table_append_keeps_existing_table_data_unchanged(table_wb: Path) -> None:
+def test_append_row_table_keeps_existing_table_data_unchanged(table_wb: Path) -> None:
     """Appending to the table should preserve all existing data rows."""
 
     original_rows = _sheet_values(table_wb, "Expenses")
 
-    excel_io_module.table_append(
+    excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
@@ -1006,12 +1219,12 @@ def test_table_append_keeps_existing_table_data_unchanged(table_wb: Path) -> Non
     assert updated_rows[:4] == original_rows[:4]
 
 
-def test_table_append_new_row_appears_exactly_once(table_wb: Path) -> None:
+def test_append_row_table_new_row_appears_exactly_once(table_wb: Path) -> None:
     """Appending to the table should add exactly one matching new row."""
 
     new_row = ["2026-06-12", "Lidl", 22.75, "Groceries"]
 
-    excel_io_module.table_append(
+    excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
@@ -1026,14 +1239,14 @@ def test_table_append_new_row_appears_exactly_once(table_wb: Path) -> None:
     assert rows.count(new_row) == 1
 
 
-def test_table_append_formula_columns_are_protected(table_wb: Path) -> None:
+def test_append_row_table_formula_columns_are_protected(table_wb: Path) -> None:
     """Table append should reject writes to schema columns marked as formulas."""
 
     schema = _table_schema()
     schema.columns[2].is_formula = True
 
     with pytest.raises(EmaValidationError):
-        excel_io_module.table_append(
+        excel_io_module.append_row(
             table_wb,
             schema,
             {
@@ -1045,11 +1258,11 @@ def test_table_append_formula_columns_are_protected(table_wb: Path) -> None:
         )
 
 
-def test_table_append_unknown_columns_raise_validation_error(table_wb: Path) -> None:
+def test_append_row_table_unknown_columns_raise_validation_error(table_wb: Path) -> None:
     """Unknown input columns should fail validation for table appends."""
 
     with pytest.raises(EmaValidationError):
-        excel_io_module.table_append(
+        excel_io_module.append_row(
             table_wb,
             _table_schema(),
             {
@@ -1062,13 +1275,13 @@ def test_table_append_unknown_columns_raise_validation_error(table_wb: Path) -> 
         )
 
 
-def test_table_append_missing_required_columns_raise_validation_error(
+def test_append_row_table_missing_required_columns_raise_validation_error(
     table_wb: Path,
 ) -> None:
     """Missing required columns should fail validation for table appends."""
 
     with pytest.raises(EmaValidationError):
-        excel_io_module.table_append(
+        excel_io_module.append_row(
             table_wb,
             _table_schema(),
             {
@@ -1079,10 +1292,10 @@ def test_table_append_missing_required_columns_raise_validation_error(
         )
 
 
-def test_table_append_preserves_valid_xlsx_workbook(table_wb: Path) -> None:
+def test_append_row_table_preserves_valid_xlsx_workbook(table_wb: Path) -> None:
     """After table append, the workbook should still open as a valid .xlsx file."""
 
-    excel_io_module.table_append(
+    excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
@@ -1101,10 +1314,10 @@ def test_table_append_preserves_valid_xlsx_workbook(table_wb: Path) -> None:
         workbook.close()
 
 
-def test_table_append_preserves_table_formatting(table_wb: Path) -> None:
+def test_append_row_table_preserves_table_formatting(table_wb: Path) -> None:
     """Appending should preserve the Excel Table's style metadata."""
 
-    excel_io_module.table_append(
+    excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
@@ -1123,6 +1336,133 @@ def test_table_append_preserves_table_formatting(table_wb: Path) -> None:
         assert table.tableStyleInfo.showRowStripes is True
     finally:
         workbook.close()
+
+
+def test_append_row_table_creates_backup_before_write(
+    ema_home: Path, table_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """append_row should create a backup before delegating to the atomic save step for tables."""
+
+    events: list[str] = []
+    real_atomic_save = excel_io_module.atomic_save
+
+    def fake_backup(path: Path) -> Path:
+        events.append("backup")
+        backup_path = config.BACKUP_DIR / "table" / "table-test-backup.xlsx"
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, backup_path)
+        return backup_path
+
+    def checked_atomic_save(workbook: object, path: Path) -> Path:
+        assert events == ["backup"]
+        events.append("save")
+        return real_atomic_save(workbook, path)
+
+    monkeypatch.setattr(excel_io_module, "backup", fake_backup)
+    monkeypatch.setattr(excel_io_module, "atomic_save", checked_atomic_save)
+
+    excel_io_module.append_row(
+        table_wb,
+        _table_schema(),
+        {
+            "Date": "2026-06-12",
+            "Store": "Lidl",
+            "Amount": 22.75,
+            "Category": "Groceries",
+        },
+    )
+
+    assert events == ["backup", "save"]
+
+
+def test_append_row_table_returns_backup_path(ema_home: Path, table_wb: Path) -> None:
+    """append_row should return the created backup path in its result for tables."""
+
+    result = excel_io_module.append_row(
+        table_wb,
+        _table_schema(),
+        {
+            "Date": "2026-06-12",
+            "Store": "Lidl",
+            "Amount": 22.75,
+            "Category": "Groceries",
+        },
+    )
+
+    assert result.backup_path is not None
+    assert Path(result.backup_path).exists()
+
+
+def test_append_row_table_returns_undo_token(ema_home: Path, table_wb: Path) -> None:
+    """append_row should expose an undo token for the created backup for tables."""
+
+    result = excel_io_module.append_row(
+        table_wb,
+        _table_schema(),
+        {
+            "Date": "2026-06-12",
+            "Store": "Lidl",
+            "Amount": 22.75,
+            "Category": "Groceries",
+        },
+    )
+
+    assert result.undo_token is not None
+    assert result.undo_token == result.backup_path
+
+
+def test_append_row_table_invokes_verify_write(
+    ema_home: Path, table_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """append_row should invoke verify_write after saving for tables."""
+
+    verify_called = False
+
+    def fake_verify_write(*args: object, **kwargs: object) -> None:
+        nonlocal verify_called
+        verify_called = True
+
+    monkeypatch.setattr(excel_io_module, "verify_write", fake_verify_write)
+
+    excel_io_module.append_row(
+        table_wb,
+        _table_schema(),
+        {
+            "Date": "2026-06-12",
+            "Store": "Lidl",
+            "Amount": 22.75,
+            "Category": "Groceries",
+        },
+    )
+
+    assert verify_called is True
+
+
+def test_append_row_table_verify_failure_restores_backup_automatically(
+    ema_home: Path, table_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If verify_write fails, append_row should restore the workbook from backup for tables."""
+
+    original_bytes = table_wb.read_bytes()
+
+    def failing_verify_write(*args: object, **kwargs: object) -> None:
+        raise WriteVerificationError("simulated verification failure")
+
+    monkeypatch.setattr(excel_io_module, "verify_write", failing_verify_write)
+
+    with pytest.raises(WriteVerificationError, match="simulated verification failure"):
+        excel_io_module.append_row(
+            table_wb,
+            _table_schema(),
+            {
+                "Date": "2026-06-12",
+                "Store": "Lidl",
+                "Amount": 22.75,
+                "Category": "Groceries",
+            },
+        )
+
+    assert table_wb.read_bytes() == original_bytes
 
 
 def test_undo_last_restores_workbook_to_exact_backup_state(plain_wb: Path) -> None:
@@ -1178,7 +1518,7 @@ def test_undo_last_restores_excel_table_workbook_correctly(table_wb: Path) -> No
 
     original_bytes = table_wb.read_bytes()
     backup_path = excel_io_module.backup(table_wb)
-    excel_io_module.table_append(
+    excel_io_module.append_row(
         table_wb,
         _table_schema(),
         {
