@@ -11,6 +11,7 @@ import pytest
 import ema.config as config
 from fixtures.make_fixtures import (
     make_formula,
+    make_formatted,
     make_offset_headers,
     make_plain,
     make_table,
@@ -59,3 +60,10 @@ def offset_wb(tmp_path: Path) -> Path:
     """Create a workbook fixture with headers below metadata rows."""
 
     return make_offset_headers(tmp_path / "offset.xlsx")
+
+
+@pytest.fixture
+def formatted_wb(tmp_path: Path) -> Path:
+    """Create a styled workbook fixture with preserved formatting features."""
+
+    return make_formatted(tmp_path / "formatted.xlsx")
