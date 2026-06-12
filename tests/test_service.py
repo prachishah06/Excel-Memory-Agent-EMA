@@ -171,6 +171,36 @@ def test_append_row_table_workbook_appends_without_callers_knowing_about_tables(
         workbook.close()
 
 
+def test_append_row_never_rediscovers_schema(
+    ema_home: Path, plain_wb: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Appending should use the persisted registry schema and never rediscover it live."""
+
+    service = _make_service()
+    entry = service.register_workbook(str(plain_wb), confirm=True)
+
+    def fail_propose_schema(*_args: object, **_kwargs: object) -> SchemaProposal:
+        raise AssertionError("append_row must not call propose_schema")
+
+    monkeypatch.setattr(service_module.schema_module, "propose_schema", fail_propose_schema)
+
+    result = service.append_row(
+        AppendRequest(
+            workbook_id=entry.id,
+            values={
+                "Date": "2026-06-12",
+                "Meal": "Snack",
+                "Food": "Apple",
+                "Calories": 95,
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert result.written_row == 5
+    assert _sheet_values(plain_wb, "FoodLog")[4] == ["2026-06-12", "Snack", "Apple", 95]
+
+
 def test_append_row_unknown_workbook_id_raises_typed_error(ema_home: Path) -> None:
     """Unknown workbook IDs should surface the registry's typed not-found error."""
 
